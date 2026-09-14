@@ -884,6 +884,7 @@ class TestEdgeCases:
             "dispatched": [],
             "completed": [],
             "failed": [],
+            "cancelled": [],
             "checked": 0,
         }
 

@@ -167,6 +167,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **A print the machine cancels no longer counts as finished.** When a Klipper
+  printer aborts a print — a failed probe, a thermal fault — it reports the
+  same idle a finished print does, and Kiln took that at face value: the job
+  was filed complete and the next file in the queue was sent straight after
+  one the printer had just rejected. Kiln now reads the machine's own verdict
+  on how the print ended and closes the job as cancelled or failed, tells you,
+  and does not hand that printer its next job in the same breath.
+
 - **Printer questions no longer answer a different question.** Asked
   something Kiln has no verified answer for, it now says so instead of
   returning a related fact with a confident label.

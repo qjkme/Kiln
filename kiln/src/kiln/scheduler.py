@@ -356,11 +356,28 @@ class JobScheduler:
             dispatched: list of {job_id, printer_name, file_name}
             completed: list of job_ids detected as complete
             failed: list of {job_id, error}
+            cancelled: list of {job_id, printer_name} — jobs the MACHINE
+                cancelled on its own (a firmware fault ends a Klipper print
+                in the same IDLE as a finish; ``last_job_result`` is what
+                tells them apart, and these are the prints that did not
+                finish).  Distinct from ``completed`` so callers and the
+                user-facing surfaces can react to a machine abort instead
+                of celebrating one.
             checked: number of active jobs checked
         """
         dispatched: list[dict[str, Any]] = []
         completed: list[str] = []
         failed: list[dict[str, str]] = []
+        cancelled: list[dict[str, str]] = []
+        # Printers whose just-closed job ended in a MACHINE-named non-finish
+        # (cancel/fault).  A fault is not a green light: the same tick must
+        # not send the next queued file at a machine that is reporting the
+        # last one aborted — that same-breath advance is exactly what the
+        # 2026-09-14 U1 incident did (job.completed at :19, next job started
+        # at :21, the abort never surfaced).  One poll later the printer is
+        # free again and normal dispatch resumes; the pause only costs the
+        # silence, not the queue.
+        paused_printers: set[str] = set()
         checked = 0
 
         # Phase 1: Check active jobs for completion / failure
@@ -437,21 +454,77 @@ class JobScheduler:
                         and getattr(pre_idle_job.status, "value", str(pre_idle_job.status)).lower()
                         in ("cancelled", "canceled")
                     )
+                    # The machine's own verdict on how the job ended, read
+                    # BEFORE anything is marked.  Klipper prints end in the
+                    # same IDLE whether they finished or the firmware raised
+                    # a fault (a failed probe does not print) — the only word
+                    # that tells them apart is print_stats' ending, which the
+                    # adapter folds into ``last_job_result``.  Naming it here
+                    # once, up front, keeps the queue row, the event and the
+                    # next dispatch from being decided before it is read.
+                    ended = getattr(state, "last_job_result", None)
+                    named = getattr(ended, "value", None)
+                    machine_cancelled = named == "cancelled"
+                    machine_failed = named == "failed"
+                    # The `else` branches below are "completed": that word is
+                    # the only one that means the print ran to its end, and
+                    # NOTHING the machine could say otherwise — nothing at all
+                    # (OctoPrint flags, RRF object model), cancelled, failed —
+                    # is that claim.  Stamping COMPLETED on a non-finish
+                    # re-prints the file the machine just rejected: read
+                    # 2026-09-14 on a Snapmaker U1, where a probe fault
+                    # cancelled the print 52 s in, the queue row still said
+                    # completed, and the next job was dispatched 1.5 s later
+                    # (incident t_f3c5bfa7).
+
                     # CANCELLED is terminal in the queue's state machine —
                     # completing it would raise, and the cancel path
                     # already published its own event when it happened.
                     if not queue_cancelled:
-                        self._queue.mark_completed(job_id)
+                        if machine_failed:
+                            self._queue.mark_failed(
+                                job_id,
+                                "Printer reported the print failed before it "
+                                "ended (print_stats: error).",
+                            )
+                        elif machine_cancelled:
+                            self._queue.cancel(job_id)
+                        else:
+                            self._queue.mark_completed(job_id)
                     with self._lock:
                         self._active_jobs.pop(job_id, None)
                         self._retry_counts.pop(job_id, None)
                         self._retry_not_before.pop(job_id, None)
                     if not queue_cancelled:
-                        self._event_bus.publish(
-                            EventType.JOB_COMPLETED,
-                            {"job_id": job_id, "printer_name": printer_name},
-                            source="scheduler",
-                        )
+                        if machine_failed:
+                            self._event_bus.publish(
+                                EventType.JOB_FAILED,
+                                {
+                                    "job_id": job_id,
+                                    "printer_name": printer_name,
+                                    "error": (
+                                        "Printer reported the print failed "
+                                        "before it ended (print_stats: error)."
+                                    ),
+                                },
+                                source="scheduler",
+                            )
+                        elif machine_cancelled:
+                            self._event_bus.publish(
+                                EventType.JOB_CANCELLED,
+                                {
+                                    "job_id": job_id,
+                                    "printer_name": printer_name,
+                                    "reason": "machine_cancelled",
+                                },
+                                source="scheduler",
+                            )
+                        else:
+                            self._event_bus.publish(
+                                EventType.JOB_COMPLETED,
+                                {"job_id": job_id, "printer_name": printer_name},
+                                source="scheduler",
+                            )
                     if queue_cancelled:
                         self._auto_record_outcome(
                             job_id, printer_name, "cancelled",
@@ -475,14 +548,12 @@ class JobScheduler:
                         # the user's own history, but it is an INFERENCE and
                         # does not federate.  Contributing is a claim about
                         # the model; only the machine gets to make it.
-                        ended = getattr(state, "last_job_result", None)
-                        named = getattr(ended, "value", None)
-                        if named == "cancelled":
+                        if machine_cancelled:
                             self._auto_record_outcome(
                                 job_id, printer_name, "cancelled",
                                 determined_by="observed",
                             )
-                        elif named == "failed":
+                        elif machine_failed:
                             self._auto_record_outcome(
                                 job_id, printer_name, "failed",
                                 determined_by="observed",
@@ -505,7 +576,23 @@ class JobScheduler:
                             determined_by="inferred",
                         )
                     self._seen_printing.discard(job_id)
-                    completed.append(job_id)
+                    # The tick ledger names what ended, not what was hoped:
+                    # a machine-named cancel or failure left here would look
+                    # to callers like a finished print.
+                    if machine_cancelled:
+                        cancelled.append({"job_id": job_id, "printer_name": printer_name})
+                        paused_printers.add(printer_name)
+                    elif machine_failed:
+                        failed.append({
+                            "job_id": job_id,
+                            "error": (
+                                "Printer reported the print failed before it "
+                                "ended (print_stats: error)."
+                            ),
+                        })
+                        paused_printers.add(printer_name)
+                    else:
+                        completed.append(job_id)
 
                 # ``confirmed_state``: it looks through a FAULT headline, so a
                 # fault raised while the machine kept working still matches here,
@@ -591,6 +678,12 @@ class JobScheduler:
         with self._lock:
             busy_printers = set(self._active_jobs.values())
         available = [p for p in idle_printers if p not in busy_printers]
+
+        # A printer whose job just ended in a machine-named cancel/fault
+        # does not get handed the next file in the same breath (see the
+        # paused_printers note above).  One poll later it is back in the
+        # pool — the pause costs one poll interval of silence, not the job.
+        available = [p for p in available if p not in paused_printers]
 
         # Smart routing: rank printers by historical success rate for the
         # next queued unassigned job.  This ensures the best-performing
@@ -692,6 +785,7 @@ class JobScheduler:
             "dispatched": dispatched,
             "completed": completed,
             "failed": failed,
+            "cancelled": cancelled,
             "checked": checked,
         }
 
